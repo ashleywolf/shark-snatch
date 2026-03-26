@@ -1,0 +1,1140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shark Snatch</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #020b1a;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: none;
+    }
+
+    video {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <video id="webcam" autoplay playsinline></video>
+  <canvas id="gameCanvas"></canvas>
+
+  <script type="module">
+    import {
+      FaceLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/vision_bundle.mjs";
+
+    // =========================================================
+    // CONFIG
+    // =========================================================
+    const CFG = {
+      // Difficulty
+      baseSharksPerSec: 0.6,
+      difficultyInterval: 30000,
+      difficultySpawnMult: 1.15,
+      difficultySpeedMult: 1.10,
+      maxDifficultyTier: 12,
+
+      // Sharks
+      sharkTypes: [
+        { name: "baby",    color: "#4fc3f7", finColor: "#0288d1", eyeColor: "#fff", size: 32,  speed: [3, 5],   points: 1, weight: 5 },
+        { name: "regular", color: "#90a4ae", finColor: "#546e7a", eyeColor: "#fff", size: 52,  speed: [2, 3.5], points: 2, weight: 3 },
+        { name: "great",   color: "#cfd8dc", finColor: "#78909c", eyeColor: "#fff", size: 78,  speed: [1, 2.2], points: 5, weight: 1 },
+      ],
+
+      // Player
+      lives: 3,
+      mouthOpenThreshold: 0.45,
+      catchRadius: 65,
+      chompCooldown: 400,
+
+      // Bubbles
+      bubbleCount: 30,
+
+      // Face landmark indices (MediaPipe 478 mesh)
+      UPPER_LIP: 13,
+      LOWER_LIP: 14,
+      NOSE_TIP: 1,
+    };
+
+    // =========================================================
+    // AUDIO ENGINE (procedural, no external files)
+    // =========================================================
+    class AudioEngine {
+      constructor() {
+        this.ctx = null;
+        this.ready = false;
+      }
+
+      init() {
+        if (this.ready) return;
+        try {
+          this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+          this.ready = true;
+        } catch (e) {
+          console.warn("Web Audio not available:", e);
+        }
+      }
+
+      _noise(duration, volume = 0.3) {
+        if (!this.ready) return;
+        const sr = this.ctx.sampleRate;
+        const len = sr * duration;
+        const buf = this.ctx.createBuffer(1, len, sr);
+        const data = buf.getChannelData(0);
+        for (let i = 0; i < len; i++) {
+          data[i] = (Math.random() * 2 - 1) * volume * (1 - i / len);
+        }
+        return buf;
+      }
+
+      splash() {
+        if (!this.ready) return;
+        const now = this.ctx.currentTime;
+
+        // filtered noise burst
+        const buf = this._noise(0.25, 0.4);
+        const src = this.ctx.createBufferSource();
+        src.buffer = buf;
+
+        const bp = this.ctx.createBiquadFilter();
+        bp.type = "bandpass";
+        bp.frequency.setValueAtTime(800, now);
+        bp.frequency.exponentialRampToValueAtTime(200, now + 0.25);
+        bp.Q.value = 1.5;
+
+        const gain = this.ctx.createGain();
+        gain.gain.setValueAtTime(0.5, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+
+        src.connect(bp).connect(gain).connect(this.ctx.destination);
+        src.start(now);
+        src.stop(now + 0.25);
+      }
+
+      chomp() {
+        if (!this.ready) return;
+        const now = this.ctx.currentTime;
+
+        const osc = this.ctx.createOscillator();
+        osc.type = "square";
+        osc.frequency.setValueAtTime(300, now);
+        osc.frequency.exponentialRampToValueAtTime(80, now + 0.12);
+
+        const gain = this.ctx.createGain();
+        gain.gain.setValueAtTime(0.35, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+
+        osc.connect(gain).connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.15);
+
+        // add a click
+        const click = this.ctx.createOscillator();
+        click.type = "sine";
+        click.frequency.setValueAtTime(600, now);
+        const cg = this.ctx.createGain();
+        cg.gain.setValueAtTime(0.2, now);
+        cg.gain.exponentialRampToValueAtTime(0.001, now + 0.04);
+        click.connect(cg).connect(this.ctx.destination);
+        click.start(now);
+        click.stop(now + 0.04);
+      }
+
+      fail() {
+        if (!this.ready) return;
+        const now = this.ctx.currentTime;
+
+        const osc = this.ctx.createOscillator();
+        osc.type = "sawtooth";
+        osc.frequency.setValueAtTime(200, now);
+        osc.frequency.exponentialRampToValueAtTime(100, now + 0.4);
+
+        const gain = this.ctx.createGain();
+        gain.gain.setValueAtTime(0.25, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.4);
+
+        osc.connect(gain).connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.4);
+      }
+
+      gameOver() {
+        if (!this.ready) return;
+        const now = this.ctx.currentTime;
+        const notes = [200, 180, 150, 100];
+        notes.forEach((freq, i) => {
+          const osc = this.ctx.createOscillator();
+          osc.type = "triangle";
+          osc.frequency.value = freq;
+          const g = this.ctx.createGain();
+          g.gain.setValueAtTime(0.25, now + i * 0.18);
+          g.gain.exponentialRampToValueAtTime(0.01, now + i * 0.18 + 0.18);
+          osc.connect(g).connect(this.ctx.destination);
+          osc.start(now + i * 0.18);
+          osc.stop(now + i * 0.18 + 0.2);
+        });
+      }
+
+      pop() {
+        if (!this.ready) return;
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(800, now);
+        osc.frequency.exponentialRampToValueAtTime(400, now + 0.06);
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.15, now);
+        g.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
+        osc.connect(g).connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.07);
+      }
+    }
+
+    const audio = new AudioEngine();
+
+    // =========================================================
+    // STATE
+    // =========================================================
+    const state = {
+      phase: "start", // start | playing | gameover
+      score: 0,
+      lives: CFG.lives,
+      highScore: parseInt(localStorage.getItem("sharkSnatch_high") || "0"),
+      sharks: [],
+      bubbles: [],
+      particles: [],
+      handPos: null,    // {x, y} normalized 0-1  (mouth position, kept as handPos for compat)
+      mouthOpen: false,
+      jawOpenVal: 0,
+      lastChompTime: 0,
+      difficultyTier: 0,
+      lastDifficultyUp: 0,
+      spawnAccum: 0,
+      gameStartTime: 0,
+      catchFlash: null, // {x, y, time, points}
+      combo: 0,
+      lastCatchTime: 0,
+      shakeUntil: 0,
+    };
+
+    // =========================================================
+    // CANVAS + VIDEO REFS
+    // =========================================================
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    const video = document.getElementById("webcam");
+
+    let W, H;
+    function resize() {
+      W = canvas.width = window.innerWidth;
+      H = canvas.height = window.innerHeight;
+    }
+    resize();
+    window.addEventListener("resize", resize);
+
+    // =========================================================
+    // MEDIAPIPE
+    // =========================================================
+    let faceLandmarker = null;
+    let modelReady = false;
+    let lastDetectionTime = 0;
+    const DETECTION_INTERVAL = 50; // ms between detections
+
+    async function initMediaPipe() {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm"
+        );
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+            delegate: "GPU",
+          },
+          outputFaceBlendshapes: true,
+          outputFacialTransformationMatrixes: false,
+          runningMode: "VIDEO",
+          numFaces: 1,
+        });
+        modelReady = true;
+      } catch (e) {
+        console.error("MediaPipe init failed:", e);
+        // try CPU fallback
+        try {
+          const vision = await FilesetResolver.forVisionTasks(
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm"
+          );
+          faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+              delegate: "CPU",
+            },
+            outputFaceBlendshapes: true,
+            runningMode: "VIDEO",
+            numFaces: 1,
+          });
+          modelReady = true;
+        } catch (e2) {
+          console.error("MediaPipe CPU fallback failed:", e2);
+        }
+      }
+    }
+
+    // =========================================================
+    // WEBCAM
+    // =========================================================
+    let camReady = false;
+
+    async function initWebcam() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await new Promise(r => { video.onloadedmetadata = r; });
+        await video.play();
+        camReady = true;
+      } catch (e) {
+        console.error("Webcam access failed:", e);
+      }
+    }
+
+    // =========================================================
+    // FACE / MOUTH DETECTION
+    // =========================================================
+    function detectFace(now) {
+      if (!modelReady || !camReady) return;
+      if (now - lastDetectionTime < DETECTION_INTERVAL) return;
+      lastDetectionTime = now;
+
+      const results = faceLandmarker.detectForVideo(video, now);
+      if (!results || !results.faceLandmarks || results.faceLandmarks.length === 0) {
+        state.handPos = null;
+        state.mouthOpen = false;
+        state.jawOpenVal = 0;
+        return;
+      }
+
+      const lm = results.faceLandmarks[0];
+
+      // Mouth position: midpoint between upper and lower lip, mirrored
+      const upperLip = lm[CFG.UPPER_LIP];
+      const lowerLip = lm[CFG.LOWER_LIP];
+      const mouthX = 1 - (upperLip.x + lowerLip.x) / 2;
+      const mouthY = (upperLip.y + lowerLip.y) / 2;
+      state.handPos = { x: mouthX, y: mouthY };
+
+      // Jaw open from blendshapes
+      let jawOpen = 0;
+      if (results.faceBlendshapes && results.faceBlendshapes.length > 0) {
+        for (const bs of results.faceBlendshapes[0].categories) {
+          if (bs.categoryName === "jawOpen") {
+            jawOpen = bs.score;
+            break;
+          }
+        }
+      }
+
+      state.jawOpenVal = jawOpen;
+      const wasMouthOpen = state.mouthOpen;
+      state.mouthOpen = jawOpen > CFG.mouthOpenThreshold;
+
+      // Trigger catch on mouth open (not sustained hold)
+      if (state.mouthOpen && !wasMouthOpen && state.phase === "playing") {
+        const timeSinceChomp = now - state.lastChompTime;
+        if (timeSinceChomp > CFG.chompCooldown) {
+          state.lastChompTime = now;
+          attemptCatch(state.handPos.x * W, state.handPos.y * H, now);
+        }
+      }
+    }
+
+    // =========================================================
+    // SHARK CLASS
+    // =========================================================
+    class Shark {
+      constructor(tier) {
+        const type = CFG.sharkTypes[tier];
+        this.type = type;
+        this.size = type.size;
+        this.points = type.points;
+        this.caught = false;
+        this.offscreen = false;
+
+        // Speed scaled by difficulty
+        const speedMult = Math.pow(CFG.difficultySpeedMult, state.difficultyTier);
+        const baseSpeed = type.speed[0] + Math.random() * (type.speed[1] - type.speed[0]);
+        this.speed = baseSpeed * speedMult;
+
+        // Spawn from a random edge
+        this._spawnFromEdge();
+
+        // Tail animation
+        this.tailPhase = Math.random() * Math.PI * 2;
+        this.tailSpeed = 4 + Math.random() * 3;
+
+        // Slight wander
+        this.wanderPhase = Math.random() * Math.PI * 2;
+        this.wanderAmp = 0.3 + Math.random() * 0.5;
+      }
+
+      _spawnFromEdge() {
+        const edge = Math.floor(Math.random() * 4);
+        const margin = this.size;
+
+        switch (edge) {
+          case 0: // left
+            this.x = -margin;
+            this.y = margin + Math.random() * (H - margin * 2);
+            this.angle = -Math.PI / 4 + Math.random() * Math.PI / 2; // rightward
+            break;
+          case 1: // right
+            this.x = W + margin;
+            this.y = margin + Math.random() * (H - margin * 2);
+            this.angle = Math.PI / 2 + Math.random() * Math.PI / 2 + Math.PI / 4; // leftward
+            break;
+          case 2: // top
+            this.x = margin + Math.random() * (W - margin * 2);
+            this.y = -margin;
+            this.angle = Math.PI / 4 + Math.random() * Math.PI / 2; // downward
+            break;
+          case 3: // bottom
+            this.x = margin + Math.random() * (W - margin * 2);
+            this.y = H + margin;
+            this.angle = -(Math.PI / 4 + Math.random() * Math.PI / 2); // upward
+            break;
+        }
+
+        this.facingLeft = Math.cos(this.angle) < 0;
+      }
+
+      update(dt) {
+        // Wander slightly
+        this.wanderPhase += dt * 1.2;
+        const wander = Math.sin(this.wanderPhase) * this.wanderAmp * dt;
+        const moveAngle = this.angle + wander;
+
+        this.x += Math.cos(moveAngle) * this.speed;
+        this.y += Math.sin(moveAngle) * this.speed;
+
+        this.tailPhase += dt * this.tailSpeed;
+
+        // Check if off-screen (with generous margin)
+        const m = this.size * 3;
+        if (this.x < -m || this.x > W + m || this.y < -m || this.y > H + m) {
+          this.offscreen = true;
+        }
+      }
+
+      draw(ctx) {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+
+        // Flip based on facing direction
+        const dir = this.facingLeft ? -1 : 1;
+        ctx.scale(dir, 1);
+
+        const s = this.size;
+        const tailWag = Math.sin(this.tailPhase) * 0.3;
+
+        // Body
+        ctx.fillStyle = this.type.color;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, s * 0.6, s * 0.3, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Belly (lighter underside)
+        ctx.fillStyle = this._lighten(this.type.color, 40);
+        ctx.beginPath();
+        ctx.ellipse(0, s * 0.08, s * 0.5, s * 0.15, 0, 0, Math.PI);
+        ctx.fill();
+
+        // Dorsal fin
+        ctx.fillStyle = this.type.finColor;
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.05, -s * 0.28);
+        ctx.lineTo(s * 0.15, -s * 0.55);
+        ctx.lineTo(s * 0.25, -s * 0.25);
+        ctx.closePath();
+        ctx.fill();
+
+        // Tail fin
+        ctx.fillStyle = this.type.finColor;
+        ctx.beginPath();
+        const tx = -s * 0.55;
+        ctx.moveTo(tx, 0);
+        ctx.lineTo(tx - s * 0.3, (-s * 0.3 + tailWag * s * 0.2));
+        ctx.lineTo(tx - s * 0.05, 0);
+        ctx.lineTo(tx - s * 0.3, (s * 0.3 + tailWag * s * 0.2));
+        ctx.closePath();
+        ctx.fill();
+
+        // Pectoral fin
+        ctx.fillStyle = this.type.finColor;
+        ctx.beginPath();
+        ctx.moveTo(s * 0.1, s * 0.2);
+        ctx.lineTo(s * 0.0, s * 0.45);
+        ctx.lineTo(s * 0.25, s * 0.25);
+        ctx.closePath();
+        ctx.fill();
+
+        // Eye
+        ctx.fillStyle = this.type.eyeColor;
+        ctx.beginPath();
+        ctx.arc(s * 0.3, -s * 0.08, s * 0.06, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#111";
+        ctx.beginPath();
+        ctx.arc(s * 0.32, -s * 0.08, s * 0.03, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Mouth
+        ctx.strokeStyle = "#37474f";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(s * 0.5, s * 0.05);
+        ctx.quadraticCurveTo(s * 0.4, s * 0.12, s * 0.2, s * 0.08);
+        ctx.stroke();
+
+        // Teeth (small triangles along mouth)
+        if (this.type.name === "great") {
+          ctx.fillStyle = "#fff";
+          for (let i = 0; i < 4; i++) {
+            const tx2 = s * 0.5 - i * s * 0.07;
+            ctx.beginPath();
+            ctx.moveTo(tx2, s * 0.06);
+            ctx.lineTo(tx2 - s * 0.02, s * 0.13);
+            ctx.lineTo(tx2 + s * 0.02, s * 0.06);
+            ctx.closePath();
+            ctx.fill();
+          }
+        }
+
+        ctx.restore();
+      }
+
+      _lighten(hex, amount) {
+        const num = parseInt(hex.replace("#", ""), 16);
+        const r = Math.min(255, (num >> 16) + amount);
+        const g = Math.min(255, ((num >> 8) & 0xff) + amount);
+        const b = Math.min(255, (num & 0xff) + amount);
+        return `rgb(${r},${g},${b})`;
+      }
+
+      hitTest(px, py) {
+        const dx = px - this.x;
+        const dy = py - this.y;
+        const hitRadius = this.size * 0.5 + CFG.catchRadius * 0.3;
+        return dx * dx + dy * dy < hitRadius * hitRadius;
+      }
+    }
+
+    // =========================================================
+    // BUBBLE PARTICLES
+    // =========================================================
+    function initBubbles() {
+      state.bubbles = [];
+      for (let i = 0; i < CFG.bubbleCount; i++) {
+        state.bubbles.push(makeBubble(true));
+      }
+    }
+
+    function makeBubble(randomY = false) {
+      return {
+        x: Math.random() * W,
+        y: randomY ? Math.random() * H : H + Math.random() * 50,
+        r: 2 + Math.random() * 6,
+        speed: 0.3 + Math.random() * 0.8,
+        wobblePhase: Math.random() * Math.PI * 2,
+        wobbleSpeed: 1 + Math.random() * 2,
+        opacity: 0.1 + Math.random() * 0.2,
+      };
+    }
+
+    function updateBubbles(dt) {
+      for (const b of state.bubbles) {
+        b.y -= b.speed;
+        b.wobblePhase += dt * b.wobbleSpeed;
+        b.x += Math.sin(b.wobblePhase) * 0.3;
+        if (b.y < -b.r * 2) {
+          Object.assign(b, makeBubble(false));
+        }
+      }
+    }
+
+    function drawBubbles(ctx) {
+      for (const b of state.bubbles) {
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(150, 220, 255, ${b.opacity})`;
+        ctx.fill();
+        // highlight
+        ctx.beginPath();
+        ctx.arc(b.x - b.r * 0.25, b.y - b.r * 0.25, b.r * 0.3, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 255, 255, ${b.opacity * 0.8})`;
+        ctx.fill();
+      }
+    }
+
+    // =========================================================
+    // CATCH PARTICLES (splash on grab)
+    // =========================================================
+    function spawnCatchParticles(x, y, success) {
+      const count = success ? 15 : 8;
+      const color = success ? "rgba(57, 211, 83," : "rgba(150, 200, 255,";
+      for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 2 + Math.random() * 5;
+        state.particles.push({
+          x, y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          life: 0.4 + Math.random() * 0.4,
+          maxLife: 0.4 + Math.random() * 0.4,
+          r: 3 + Math.random() * 5,
+          color,
+        });
+      }
+    }
+
+    function updateParticles(dt) {
+      for (let i = state.particles.length - 1; i >= 0; i--) {
+        const p = state.particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.15; // gravity
+        p.life -= dt;
+        if (p.life <= 0) state.particles.splice(i, 1);
+      }
+    }
+
+    function drawParticles(ctx) {
+      for (const p of state.particles) {
+        const alpha = Math.max(0, p.life / p.maxLife);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * alpha, 0, Math.PI * 2);
+        ctx.fillStyle = p.color + alpha.toFixed(2) + ")";
+        ctx.fill();
+      }
+    }
+
+    // =========================================================
+    // CATCH LOGIC
+    // =========================================================
+    function attemptCatch(hx, hy, now) {
+      let caught = false;
+      audio.splash();
+      spawnCatchParticles(hx, hy, false);
+
+      for (let i = state.sharks.length - 1; i >= 0; i--) {
+        const shark = state.sharks[i];
+        if (shark.caught) continue;
+        if (shark.hitTest(hx, hy)) {
+          shark.caught = true;
+          caught = true;
+
+          // Combo
+          if (now - state.lastCatchTime < 2000) {
+            state.combo++;
+          } else {
+            state.combo = 1;
+          }
+          state.lastCatchTime = now;
+
+          const comboMult = Math.min(state.combo, 5);
+          const pts = shark.points * comboMult;
+          state.score += pts;
+
+          // Flash indicator
+          state.catchFlash = { x: shark.x, y: shark.y, time: now, points: pts, combo: state.combo };
+
+          audio.chomp();
+          spawnCatchParticles(shark.x, shark.y, true);
+          state.sharks.splice(i, 1);
+          break; // only catch one per grab
+        }
+      }
+
+      if (!caught) {
+        audio.pop();
+      }
+    }
+
+    // =========================================================
+    // SHARK SPAWNING
+    // =========================================================
+    function pickSharkType() {
+      // weighted random
+      const totalWeight = CFG.sharkTypes.reduce((s, t) => s + t.weight, 0);
+      let r = Math.random() * totalWeight;
+      for (let i = 0; i < CFG.sharkTypes.length; i++) {
+        r -= CFG.sharkTypes[i].weight;
+        if (r <= 0) return i;
+      }
+      return 0;
+    }
+
+    function updateSpawning(dt, now) {
+      // Difficulty ramp
+      if (now - state.lastDifficultyUp > CFG.difficultyInterval && state.difficultyTier < CFG.maxDifficultyTier) {
+        state.difficultyTier++;
+        state.lastDifficultyUp = now;
+      }
+
+      const spawnRate = CFG.baseSharksPerSec * Math.pow(CFG.difficultySpawnMult, state.difficultyTier);
+      state.spawnAccum += dt * spawnRate;
+
+      while (state.spawnAccum >= 1) {
+        state.spawnAccum -= 1;
+        const tier = pickSharkType();
+        state.sharks.push(new Shark(tier));
+      }
+    }
+
+    // =========================================================
+    // GAME LOGIC
+    // =========================================================
+    function updateGame(dt, now) {
+      updateSpawning(dt, now);
+
+      // Update sharks
+      for (let i = state.sharks.length - 1; i >= 0; i--) {
+        const shark = state.sharks[i];
+        shark.update(dt);
+
+        if (shark.offscreen && !shark.caught) {
+          state.sharks.splice(i, 1);
+          state.lives--;
+          state.shakeUntil = now + 300;
+          audio.fail();
+
+          if (state.lives <= 0) {
+            endGame(now);
+            return;
+          }
+        }
+      }
+
+      updateBubbles(dt);
+      updateParticles(dt);
+    }
+
+    function startGame(now) {
+      audio.init();
+      state.phase = "playing";
+      state.score = 0;
+      state.lives = CFG.lives;
+      state.sharks = [];
+      state.particles = [];
+      state.combo = 0;
+      state.mouthOpen = false;
+      state.jawOpenVal = 0;
+      state.difficultyTier = 0;
+      state.spawnAccum = 0;
+      state.catchFlash = null;
+      state.gameStartTime = now;
+      state.lastDifficultyUp = now;
+      state.lastCatchTime = 0;
+      initBubbles();
+    }
+
+    function endGame(now) {
+      state.phase = "gameover";
+      if (state.score > state.highScore) {
+        state.highScore = state.score;
+        localStorage.setItem("sharkSnatch_high", String(state.highScore));
+      }
+      audio.gameOver();
+    }
+
+    // =========================================================
+    // RENDERING
+    // =========================================================
+    function drawOceanBackground() {
+      const grad = ctx.createLinearGradient(0, 0, 0, H);
+      grad.addColorStop(0, "#0a1628");
+      grad.addColorStop(0.3, "#0d2137");
+      grad.addColorStop(0.7, "#0b2a4a");
+      grad.addColorStop(1, "#062040");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, W, H);
+
+      // Subtle light rays from above
+      ctx.save();
+      ctx.globalAlpha = 0.04;
+      for (let i = 0; i < 5; i++) {
+        const x = W * (0.15 + i * 0.18);
+        ctx.beginPath();
+        ctx.moveTo(x - 30, 0);
+        ctx.lineTo(x + 60, H);
+        ctx.lineTo(x - 60, H);
+        ctx.closePath();
+        ctx.fillStyle = "#4fc3f7";
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function drawCameraFeed() {
+      if (!camReady) return;
+      ctx.save();
+      ctx.globalAlpha = 0.15;
+      // Mirror the video
+      ctx.translate(W, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, 0, 0, W, H);
+      ctx.restore();
+    }
+
+    function drawHand(now) {
+      if (!state.handPos) return;
+
+      const hx = state.handPos.x * W;
+      const hy = state.handPos.y * H;
+
+      // Scale the mouth indicator by jaw openness
+      const openness = state.jawOpenVal;
+      const baseRadius = CFG.catchRadius * 0.5;
+      const radius = baseRadius + openness * CFG.catchRadius * 0.8;
+      const isOpen = state.mouthOpen;
+
+      // Outer glow
+      ctx.beginPath();
+      ctx.arc(hx, hy, radius + 10, 0, Math.PI * 2);
+      ctx.fillStyle = isOpen
+        ? `rgba(57, 211, 83, 0.15)`
+        : `rgba(150, 220, 255, 0.08)`;
+      ctx.fill();
+
+      // Mouth shape (oval that opens with jaw)
+      const mouthWidth = radius * 1.3;
+      const mouthHeight = radius * (0.4 + openness * 1.2);
+
+      ctx.beginPath();
+      ctx.ellipse(hx, hy, mouthWidth, mouthHeight, 0, 0, Math.PI * 2);
+      ctx.strokeStyle = isOpen
+        ? `rgba(57, 211, 83, 0.6)`
+        : `rgba(150, 220, 255, 0.3)`;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      // Teeth along top and bottom when mouth is open
+      if (openness > 0.2) {
+        const alpha = Math.min(1, (openness - 0.2) * 2);
+        ctx.fillStyle = `rgba(255, 255, 255, ${alpha * 0.7})`;
+        const teethCount = 6;
+        for (let i = 0; i < teethCount; i++) {
+          const t = (i + 0.5) / teethCount;
+          const angle = -Math.PI * 0.8 + t * Math.PI * 1.6;
+          // Top teeth (pointing down)
+          const tx = hx + Math.cos(angle) * mouthWidth * 0.85;
+          const ty = hy + Math.sin(angle) * mouthHeight * 0.85;
+          ctx.beginPath();
+          ctx.moveTo(tx - 4, ty);
+          ctx.lineTo(tx, ty + 8);
+          ctx.lineTo(tx + 4, ty);
+          ctx.closePath();
+          ctx.fill();
+          // Bottom teeth (pointing up) - mirror
+          const bAngle = Math.PI * 0.8 - t * Math.PI * 1.6;
+          const bx = hx + Math.cos(bAngle) * mouthWidth * 0.85;
+          const by = hy + Math.sin(bAngle) * mouthHeight * 0.85;
+          ctx.beginPath();
+          ctx.moveTo(bx - 4, by);
+          ctx.lineTo(bx, by - 8);
+          ctx.lineTo(bx + 4, by);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+
+      // Chomp flash
+      if (isOpen) {
+        ctx.beginPath();
+        ctx.arc(hx, hy, radius * 0.2, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(57, 211, 83, 0.4)`;
+        ctx.fill();
+      }
+    }
+
+    function drawHUD(now) {
+      // Score
+      ctx.fillStyle = "#e6f1ff";
+      ctx.font = "bold 28px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(`Score: ${state.score}`, 20, 40);
+
+      // High score
+      ctx.font = "16px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillStyle = "#8b949e";
+      ctx.fillText(`Best: ${state.highScore}`, 20, 62);
+
+      // Lives (shark emojis)
+      ctx.textAlign = "right";
+      ctx.font = "28px sans-serif";
+      let livesStr = "";
+      for (let i = 0; i < CFG.lives; i++) {
+        livesStr += i < state.lives ? "\u{1F9C8}" : "\u{1F480}";
+      }
+      ctx.fillText(livesStr, W - 20, 40);
+
+      // Difficulty indicator
+      ctx.font = "14px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillStyle = "#8b949e";
+      ctx.textAlign = "right";
+      const elapsed = Math.floor((now - state.gameStartTime) / 1000);
+      ctx.fillText(`Depth: ${state.difficultyTier + 1}  |  ${elapsed}s`, W - 20, 62);
+
+      // Combo
+      if (state.combo > 1 && now - state.lastCatchTime < 2000) {
+        ctx.textAlign = "center";
+        ctx.font = "bold 22px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillStyle = "#39d353";
+        ctx.fillText(`${state.combo}x COMBO`, W / 2, 40);
+      }
+
+      // Catch flash (floating +points)
+      if (state.catchFlash && now - state.catchFlash.time < 1000) {
+        const t = (now - state.catchFlash.time) / 1000;
+        const alpha = 1 - t;
+        const yOff = t * 60;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.textAlign = "center";
+        ctx.font = "bold 32px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillStyle = "#39d353";
+        ctx.fillText(`+${state.catchFlash.points}`, state.catchFlash.x, state.catchFlash.y - yOff);
+        ctx.restore();
+      }
+    }
+
+    function drawStartScreen() {
+      drawOceanBackground();
+      drawBubbles(ctx);
+
+      // Draw a couple decorative sharks
+      const demoTime = performance.now() / 1000;
+      ctx.save();
+      ctx.globalAlpha = 0.4;
+      const demoShark = new Shark(1);
+      demoShark.x = W * 0.3 + Math.sin(demoTime * 0.5) * 80;
+      demoShark.y = H * 0.35;
+      demoShark.tailPhase = demoTime * 5;
+      demoShark.facingLeft = false;
+      demoShark.draw(ctx);
+
+      const demoShark2 = new Shark(0);
+      demoShark2.x = W * 0.7 + Math.sin(demoTime * 0.7 + 1) * 60;
+      demoShark2.y = H * 0.55;
+      demoShark2.tailPhase = demoTime * 6;
+      demoShark2.facingLeft = true;
+      demoShark2.draw(ctx);
+      ctx.restore();
+
+      // Title
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#e6f1ff";
+      ctx.font = "bold 56px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText("\u{1F988} Shark Snatch", W / 2, H * 0.28);
+
+      // Subtitle
+      ctx.font = "22px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillStyle = "#8b949e";
+      ctx.fillText("Catch sharks with your mouth!", W / 2, H * 0.34);
+
+      // Status
+      ctx.font = "18px -apple-system, BlinkMacSystemFont, sans-serif";
+      if (!camReady) {
+        ctx.fillStyle = "#f0883e";
+        ctx.fillText("Waiting for camera access...", W / 2, H * 0.55);
+      } else if (!modelReady) {
+        ctx.fillStyle = "#f0883e";
+        ctx.fillText("Loading face tracking model...", W / 2, H * 0.55);
+      } else {
+        ctx.fillStyle = "#39d353";
+        ctx.fillText("Camera ready! Face tracking loaded.", W / 2, H * 0.53);
+
+        // Instructions
+        ctx.fillStyle = "#8b949e";
+        ctx.font = "16px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillText("Move your head to line up with a shark", W / 2, H * 0.59);
+        ctx.fillText("Open your mouth wide to CHOMP it", W / 2, H * 0.63);
+        ctx.fillText("Don't let them swim away! You have 3 lives.", W / 2, H * 0.67);
+
+        // Start prompt
+        const pulse = 0.7 + Math.sin(demoTime * 3) * 0.3;
+        ctx.globalAlpha = pulse;
+        ctx.fillStyle = "#39d353";
+        ctx.font = "bold 24px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillText("Click or tap anywhere to start", W / 2, H * 0.78);
+        ctx.globalAlpha = 1;
+      }
+
+      // High score
+      if (state.highScore > 0) {
+        ctx.fillStyle = "#8b949e";
+        ctx.font = "16px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillText(`High score: ${state.highScore}`, W / 2, H * 0.88);
+      }
+    }
+
+    function drawGameOverScreen(now) {
+      drawOceanBackground();
+      drawBubbles(ctx);
+
+      // Darkened overlay
+      ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.textAlign = "center";
+
+      // Game over title
+      ctx.fillStyle = "#f85149";
+      ctx.font = "bold 48px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText("Game Over", W / 2, H * 0.3);
+
+      // Score
+      ctx.fillStyle = "#e6f1ff";
+      ctx.font = "bold 36px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText(`Score: ${state.score}`, W / 2, H * 0.42);
+
+      // High score
+      const isNew = state.score >= state.highScore && state.score > 0;
+      if (isNew) {
+        ctx.fillStyle = "#39d353";
+        ctx.font = "bold 22px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillText("New high score!", W / 2, H * 0.50);
+      } else {
+        ctx.fillStyle = "#8b949e";
+        ctx.font = "18px -apple-system, BlinkMacSystemFont, sans-serif";
+        ctx.fillText(`Best: ${state.highScore}`, W / 2, H * 0.50);
+      }
+
+      // Stats
+      ctx.fillStyle = "#8b949e";
+      ctx.font = "16px -apple-system, BlinkMacSystemFont, sans-serif";
+      const duration = Math.floor((now - state.gameStartTime) / 1000);
+      ctx.fillText(`Survived ${duration} seconds  |  Reached depth ${state.difficultyTier + 1}`, W / 2, H * 0.58);
+
+      // Play again
+      const pulse = 0.7 + Math.sin(now / 1000 * 3) * 0.3;
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = "#39d353";
+      ctx.font = "bold 24px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText("Click or tap to play again", W / 2, H * 0.72);
+      ctx.globalAlpha = 1;
+    }
+
+    // =========================================================
+    // MAIN LOOP
+    // =========================================================
+    let lastTime = 0;
+
+    function loop(timestamp) {
+      requestAnimationFrame(loop);
+
+      const now = timestamp || performance.now();
+      const rawDt = lastTime ? (now - lastTime) / 1000 : 0.016;
+      const dt = Math.min(rawDt, 0.1); // clamp to avoid physics explosions on tab switch
+      lastTime = now;
+
+      // Screen shake offset
+      let shakeX = 0, shakeY = 0;
+      if (now < state.shakeUntil) {
+        shakeX = (Math.random() - 0.5) * 8;
+        shakeY = (Math.random() - 0.5) * 8;
+      }
+
+      ctx.save();
+      ctx.translate(shakeX, shakeY);
+
+      // Detect face every frame (throttled internally)
+      detectFace(now);
+
+      if (state.phase === "start") {
+        updateBubbles(dt);
+        drawStartScreen();
+      } else if (state.phase === "playing") {
+        updateGame(dt, now);
+        drawOceanBackground();
+        drawCameraFeed();
+        drawBubbles(ctx);
+        // Draw sharks
+        for (const shark of state.sharks) {
+          shark.draw(ctx);
+        }
+        drawParticles(ctx);
+        drawHand(now);
+        drawHUD(now);
+      } else if (state.phase === "gameover") {
+        updateBubbles(dt);
+        updateParticles(dt);
+        drawGameOverScreen(now);
+      }
+
+      ctx.restore();
+    }
+
+    // =========================================================
+    // INPUT (click/tap to start or restart)
+    // =========================================================
+    canvas.addEventListener("click", () => {
+      audio.init();
+      if (state.phase === "start" && camReady && modelReady) {
+        startGame(performance.now());
+      } else if (state.phase === "gameover") {
+        startGame(performance.now());
+      }
+    });
+
+    // Also allow spacebar
+    document.addEventListener("keydown", (e) => {
+      if (e.code === "Space") {
+        e.preventDefault();
+        audio.init();
+        if (state.phase === "start" && camReady && modelReady) {
+          startGame(performance.now());
+        } else if (state.phase === "gameover") {
+          startGame(performance.now());
+        }
+      }
+    });
+
+    // =========================================================
+    // INIT
+    // =========================================================
+    async function init() {
+      initBubbles();
+      // Start loading in parallel
+      await Promise.all([initWebcam(), initMediaPipe()]);
+    }
+
+    init();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
