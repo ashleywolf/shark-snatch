@@ -50,25 +50,25 @@
     // CONFIG
     // =========================================================
     const CFG = {
-      // Difficulty
-      baseSharksPerSec: 0.6,
-      difficultyInterval: 30000,
-      difficultySpawnMult: 1.15,
-      difficultySpeedMult: 1.10,
-      maxDifficultyTier: 12,
+      // Difficulty (gentle ramp for toddlers)
+      baseSharksPerSec: 0.35,
+      difficultyInterval: 60000,
+      difficultySpawnMult: 1.06,
+      difficultySpeedMult: 1.04,
+      maxDifficultyTier: 5,
 
-      // Sharks
+      // Sharks (big and slow)
       sharkTypes: [
-        { name: "baby",    color: "#4fc3f7", finColor: "#0288d1", eyeColor: "#fff", size: 32,  speed: [3, 5],   points: 1, weight: 5 },
-        { name: "regular", color: "#90a4ae", finColor: "#546e7a", eyeColor: "#fff", size: 52,  speed: [2, 3.5], points: 2, weight: 3 },
-        { name: "great",   color: "#cfd8dc", finColor: "#78909c", eyeColor: "#fff", size: 78,  speed: [1, 2.2], points: 5, weight: 1 },
+        { name: "baby",    color: "#4fc3f7", finColor: "#0288d1", eyeColor: "#fff", size: 70,  speed: [1.2, 2],   points: 1, weight: 5 },
+        { name: "regular", color: "#90a4ae", finColor: "#546e7a", eyeColor: "#fff", size: 100, speed: [0.8, 1.5], points: 2, weight: 3 },
+        { name: "great",   color: "#cfd8dc", finColor: "#78909c", eyeColor: "#fff", size: 140, speed: [0.5, 1.0], points: 5, weight: 1 },
       ],
 
-      // Player
-      lives: 3,
-      mouthOpenThreshold: 0.45,
-      catchRadius: 65,
-      chompCooldown: 400,
+      // Player (forgiving for little kids)
+      lives: 8,
+      mouthOpenThreshold: 0.3,
+      catchRadius: 110,
+      chompCooldown: 300,
 
       // Bubbles
       bubbleCount: 30,
